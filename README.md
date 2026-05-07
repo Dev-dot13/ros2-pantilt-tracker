@@ -1,6 +1,6 @@
 # ROS2 Pan-Tilt Target Tracker
 
-A distributed ROS2 implementation of a real-time face-tracking pan-tilt camera system. The system splits perception and control across two devices — a laptop with a dedicated GPU handles YOLO inference, while a Raspberry Pi 4 handles all hardware I/O — communicating over a local WiFi network using ROS2 DDS.
+A distributed ROS2 implementation of a real-time object-tracking pan-tilt camera system with an integrated LLM intelligence layer. The system splits perception and control across two devices — a laptop with a dedicated GPU handles YOLO inference and LLM reasoning, while a Raspberry Pi 4 handles all hardware I/O — communicating over a local WiFi network using ROS2 DDS.
 
 > **Previous version:** This project is a ROS2 rebuild of an earlier single-device implementation that ran entirely on the Raspberry Pi 4. That version is available at [Target-following-Camera](https://github.com/Dev-dot13/Target-following-Camera).
 
@@ -8,62 +8,142 @@ A distributed ROS2 implementation of a real-time face-tracking pan-tilt camera s
 
 ## Demo
 
-> Photos and working videos of the model coming soon.
+> Photos and working videos coming soon.
 
 ---
 
 ## How It Works
 
-When a face enters the camera frame, the system detects it using YOLOv8, computes the pixel error between the face centre and the frame centre, and drives two DC geared motors via a PI controller to keep the face centred. When no face is detected, the camera slowly sweeps the scene searching for a target.
+When a target object enters the camera frame, the system detects it using YOLOv8s, computes the pixel error between the target centre and the frame centre, and drives two DC geared motors via a PI controller to keep the target centred. When no target is detected, the camera sweeps the scene searching for one.
 
-The key architectural decision is the **split between devices**: the camera streams compressed JPEG frames over WiFi to the laptop, where GPU-accelerated inference runs. Only the resulting bounding box coordinates travel back to the RPi4 as motor commands — a tiny fraction of the bandwidth that raw video would require in reverse.
+The system has two layers of intelligence:
+
+**Layer 1 — YOLO tracking (always running):** The camera streams compressed JPEG frames over WiFi to the laptop, where GPU-accelerated YOLOv8s inference runs at 20Hz. Lucas-Kanade optical flow fills in between inference frames. Only bounding box coordinates and scene metadata travel to the controller — a tiny fraction of the bandwidth raw video would require. Movement detection is derived directly from optical flow displacement magnitude.
+
+**Layer 2 — LLM command layer (on-demand):** A locally running LLaVA 7B vision-language model receives natural language commands — typed or spoken — and translates them into precise motor actions. LLaVA sees the YOLO-annotated frame (with bounding boxes and labels already drawn) giving it grounded scene understanding. Commands are interpreted in natural language and executed immediately.
 
 ---
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────┐
-│                  LAPTOP (RTX 4060)                  │
-│                                                     │
-│   detector_node ──► controller_node ──► viz_node    │
-│        │                  │                         │
-│   YOLOv8              PI control +                  │
-│   inference +         search sweep                  │
-│   optical flow                                      │
-└────────────┬──────────────┬─────────────────────────┘
-             │ WiFi (DDS)   │ WiFi (DDS)
-┌────────────▼──────────────▼─────────────────────────┐
-│              RASPBERRY PI 4 (Docker)                │
-│                                                     │
-│        camera_node          motor_driver_node       │
-│             │                      │                │
-│       USB camera              GPIO + PWM            │
-│    compressed JPEG            DRV8833 driver        │
-│       streaming               Pan + Tilt motors     │
-└─────────────────────────────────────────────────────┘
-```
+┌──────────────────────────────────────────────────────────────────┐
+│                        LAPTOP (RTX 4060)                         │
+│                                                                  │
+│  voice_input_node                                                │
+│       │ (Whisper STT)                                            │
+│       ▼                                                          │
+│  command_interface_node ──► /llm/command ──► llm_node            │
+│                                               │  (LLaVA 7B)      │
+│                                               ▼                  │
+│  detector_node ──► controller_node ◄── /tracker/llm_command      │
+│       │    │            │                                        │
+│  YOLOv8s   │        PI control +                                 │
+│  inference │        LLaVA command                                │
+│  + optical │        layer                                        │
+│  flow      │                                                     │
+│            ▼                                                     │
+│     /camera/image/annotated ──► llm_node (LLaVA context)         │
+│     /tracker/scene_info     ──► controller_node                  │
+│                                 (movement + count from YOLO)     │
+│                                                                  │
+│                         viz_node                                 │
+└──────────────┬──────────────────┬────────────────────────────────┘
+│ WiFi (DDS)       │ WiFi (DDS)
+┌──────────────▼──────────────────▼────────────────────────────────┐
+│                    RASPBERRY PI 4 (Docker)                       │
+│                                                                  │
+│         camera_node                  motor_driver_node           │
+│              │                              │                    │
+│        USB camera                    GPIO + PWM                  │
+│     compressed JPEG                  DRV8833 driver              │
+│        streaming                     Pan + Tilt motors           │
+└──────────────────────────────────────────────────────────────────┘
 
 ### ROS2 Topics
 
 | Topic | Message Type | Publisher | Subscribers |
 |---|---|---|---|
-| `/camera/image/compressed` | `sensor_msgs/CompressedImage` | `camera_node` | `detector_node`, `viz_node` |
+| `/camera/image/compressed` | `sensor_msgs/CompressedImage` | `camera_node` | `detector_node`, `viz_node`, `llm_node` |
+| `/camera/image/annotated` | `sensor_msgs/CompressedImage` | `detector_node` | `llm_node` |
 | `/tracker/target_box` | `pantilt_interfaces/BoundingBox` | `detector_node` | `controller_node`, `viz_node` |
-| `/motor/cmd` | `pantilt_interfaces/MotorCmd` | `controller_node` | `motor_driver_node` |
+| `/tracker/scene_info` | `std_msgs/String` (JSON) | `detector_node` | `controller_node`, `llm_node` |
+| `/tracker/set_target` | `std_msgs/String` | `llm_node` | `detector_node` |
+| `/tracker/llm_command` | `std_msgs/String` (JSON) | `llm_node` | `controller_node` |
 | `/tracker/status` | `std_msgs/String` | `controller_node` | `viz_node` |
+| `/motor/cmd` | `pantilt_interfaces/MotorCmd` | `controller_node` | `motor_driver_node` |
+| `/llm/command` | `std_msgs/String` | `voice_input_node` / `command_interface_node` | `llm_node` |
+| `/llm/response` | `std_msgs/String` | `llm_node` | `voice_input_node` / `command_interface_node` |
 
 ### Node Descriptions
 
-**`camera_node`** — Runs on RPi4. Captures frames from the USB camera, JPEG-compresses them, and publishes at 20Hz. Keeps bandwidth low by sending compressed images instead of raw frames.
+**`camera_node`** — Runs on RPi4. Captures frames from the USB camera, JPEG-compresses them, and publishes at 20Hz.
 
-**`detector_node`** — Runs on laptop. Subscribes to compressed frames, runs YOLOv8 detection on every frame using the GPU, tracks the detected face across frames using IoU matching and Lucas-Kanade optical flow between inference frames, then publishes the bounding box.
+**`detector_node`** — Runs on laptop. Runs YOLOv8s detection on every frame using the GPU. Tracks the detected target across frames using IoU matching and Lucas-Kanade optical flow between inference frames. Derives movement detection from optical flow displacement magnitude. Publishes the bounding box, an annotated frame with boxes and labels drawn, and a JSON scene info message containing target count, movement state, and position.
 
-**`controller_node`** — Runs on laptop. Receives the bounding box, computes pan and tilt pixel errors relative to the frame centre, applies a soft deadzone and PI control law, and publishes motor speed commands. Also handles the search sweep state machine when no face is detected.
+**`controller_node`** — Runs on laptop. Receives the bounding box and applies a soft deadzone and PI control law to drive motor speed commands. Subscribes to YOLO-derived scene info for movement-based motor modulation. Subscribes to LLaVA command decisions and executes them — supporting TRACK, STOP, PAN, TILT, LOCK, FIND, and SEARCH modes. Timed commands expire automatically and resume normal tracking.
+
+**`llm_node`** — Runs on laptop. Receives natural language commands on `/llm/command`. Passes the YOLO-annotated frame and current scene context to LLaVA 7B running locally via Ollama. Parses LLaVA's JSON decision and dispatches motor commands, target changes, or text responses. Handles CHANGE_TARGET by publishing the new object class to `/tracker/set_target`.
+
+**`voice_input_node`** — Runs on laptop. Continuously listens to the microphone using voice activity detection (webrtcvad). When speech is detected and silence follows, transcribes the audio clip using faster-whisper (Whisper base, GPU-accelerated). Publishes the transcript to `/llm/command` and prints LLaVA responses from `/llm/response`.
+
+**`command_interface_node`** — Runs on laptop. Typed terminal alternative to voice input. Publishes typed commands to `/llm/command` and prints LLaVA responses from `/llm/response`.
 
 **`motor_driver_node`** — Runs on RPi4. Receives motor speed commands and drives two DC geared motors via PWM through a DRV8833 motor driver. Includes a watchdog timer that stops the motors if no command is received for over 1 second.
 
-**`viz_node`** — Runs on laptop. Subscribes to the camera feed and bounding box, draws the HUD overlay (bounding box, target crosshair, tracking status), and displays the live window.
+**`viz_node`** — Runs on laptop. Draws the HUD overlay and displays the live tracking window.
+
+---
+
+## LLM Intelligence Layer
+
+### Models
+
+| Model | Purpose | Runs when | VRAM usage |
+|---|---|---|---|
+| LLaVA 7B (4-bit) | Command understanding, scene reasoning, question answering | On-demand only | ~5.2 GB, unloads after each call |
+| Whisper base | Speech-to-text transcription | When speech detected | ~200 MB |
+| YOLOv8s | Object detection and tracking | Every frame at 20Hz | ~200 MB |
+
+### Supported Commands
+
+Commands are spoken or typed in plain English. Examples:
+
+**Movement:**
+look to your right
+pan left slowly
+look up
+tilt down fast
+look right until you find someone
+look up until you find someone
+
+**Tracking:**
+find me
+start tracking
+stop
+stay there
+follow that bottle
+go back to following people
+
+**Awareness:**
+who do you see?
+what do you see?
+how many people are visible?
+describe the scene
+
+### How LLaVA Understands the Scene
+
+LLaVA receives the YOLO-annotated frame — with green bounding boxes, object labels, and a red crosshair showing where the tracker is aimed — rather than a raw camera frame. This grounds LLaVA's reasoning in what YOLO has already detected, reducing hallucination and improving command accuracy.
+
+The current YOLO scene state (target class, detection status, count, movement, position) is also included as text in every LLaVA prompt.
+
+### Dynamic Target Switching
+
+The tracked object class can be changed at runtime by voice or typed command:
+follow that bottle      → YOLO switches from 'person' to 'bottle'
+track that chair        → YOLO switches to 'chair'
+go back to people       → YOLO switches back to 'person'
+
+Any of the 80 COCO object classes that YOLOv8s was trained on can be used as a tracking target.
 
 ---
 
@@ -72,7 +152,7 @@ The key architectural decision is the **split between devices**: the camera stre
 | Component | Details |
 |---|---|
 | Raspberry Pi 4 | 4GB RAM, running Debian 12 Bookworm |
-| Laptop | Ubuntu 24.04, NVIDIA RTX 4060 GPU |
+| Laptop | Ubuntu 24.04, NVIDIA RTX 4060 8GB VRAM |
 | USB Camera | Logitech C170, connected to RPi4 |
 | DC Geared Motors | 2x, one for pan axis, one for tilt axis |
 | Motor Driver | DRV8833 dual H-bridge |
@@ -98,9 +178,12 @@ The key architectural decision is the **split between devices**: the camera stre
 - Ubuntu 24.04
 - ROS2 Jazzy Jalisco (desktop)
 - Python 3.12
-- PyTorch with CUDA support
-- Ultralytics (YOLOv8)
+- PyTorch with CUDA support (cu118)
+- Ultralytics YOLOv8
 - OpenCV
+- Ollama with `llava:7b` model
+- faster-whisper
+- sounddevice, webrtcvad, portaudio
 
 **Raspberry Pi 4:**
 - Debian 12 Bookworm
@@ -108,22 +191,30 @@ The key architectural decision is the **split between devices**: the camera stre
 - OpenCV (headless)
 - RPi.GPIO
 
-### ROS2 Packages
-
-```
+### Repository Structure
 ros2_ws/src/
-├── pantilt_interfaces/    # Custom message definitions
-│   └── msg/
-│       ├── BoundingBox.msg
-│       └── MotorCmd.msg
-└── pantilt_tracker/       # All Python nodes
-    └── pantilt_tracker/
-        ├── camera_node.py
-        ├── detector_node.py
-        ├── controller_node.py
-        ├── motor_driver_node.py
-        └── viz_node.py
-```
+├── pantilt_interfaces/            # Custom message definitions
+│   ├── msg/
+│   │   ├── BoundingBox.msg
+│   │   └── MotorCmd.msg
+│   ├── CMakeLists.txt
+│   └── package.xml
+└── pantilt_tracker/               # All Python nodes
+├── pantilt_tracker/
+│   ├── init.py
+│   ├── camera_node.py
+│   ├── detector_node.py
+│   ├── controller_node.py
+│   ├── motor_driver_node.py
+│   ├── viz_node.py
+│   ├── llm_node.py
+│   ├── voice_input_node.py
+│   └── command_interface_node.py
+├── resource/
+│   └── pantilt_tracker
+├── package.xml
+├── setup.cfg
+└── setup.py
 
 ---
 
@@ -131,59 +222,73 @@ ros2_ws/src/
 
 ### Prerequisites
 
-Both devices must be on the same WiFi network and have the same `ROS_DOMAIN_ID`.
+Both devices must be on the same WiFi network with the same `ROS_DOMAIN_ID`.
 
 ---
 
 ### Laptop Setup
 
-#### 1. Source ROS2 and install Python dependencies
+#### 1. Source ROS2 and set environment
 
 ```bash
-# Add to ~/.bashrc
-source /opt/ros/jazzy/setup.bash
-export ROS_DOMAIN_ID=30
+echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
+echo "export ROS_DOMAIN_ID=30" >> ~/.bashrc
+source ~/.bashrc
 ```
 
-Install PyTorch with CUDA (get exact command for your CUDA version from pytorch.org):
+#### 2. Install Python dependencies
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --break-system-packages
-pip install ultralytics opencv-python numpy --break-system-packages
+# PyTorch with CUDA 11.8
+pip install torch torchvision torchaudio \
+  --index-url https://download.pytorch.org/whl/cu118 \
+  --break-system-packages
+
+# YOLO and vision
+pip install ultralytics opencv-python numpy \
+  --break-system-packages
+
+# Voice input
+sudo apt install portaudio19-dev libportaudio2 -y
+pip install faster-whisper sounddevice webrtcvad \
+  --break-system-packages
 ```
 
-#### 2. Create workspace and clone repository
+#### 3. Install Ollama and pull LLaVA
+
+```bash
+curl -fsSL https://ollama.com/install.sh | sh
+ollama pull llava:7b
+```
+
+#### 4. Clone repository and build
 
 ```bash
 mkdir -p ~/Projects/ros_project1/ros2_ws/src
 cd ~/Projects/ros_project1/ros2_ws/src
 git clone https://github.com/Dev-dot13/ros2-pantilt-tracker.git .
-```
 
-#### 3. Build
-
-```bash
 cd ~/Projects/ros_project1/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
-
-# Add to ~/.bashrc
 echo "source ~/Projects/ros_project1/ros2_ws/install/setup.bash" >> ~/.bashrc
 ```
 
-#### 4. Download the face detection model
+#### 5. Download the YOLO model
 
 ```bash
 mkdir -p ~/Projects/ros_project1/models
 cd ~/Projects/ros_project1/models
-wget https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n.pt
+wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8s.pt
 ```
 
-#### 5. Update model path in detector_node.py
+#### 6. Update the model path in detector_node.py
 
 ```python
-# In detector_node.py, update this line to your actual path
-self.model = YOLO('/home/YOUR_USERNAME/Projects/ros_project1/models/yolov8n.pt', task='detect')
+# In detector_node.py, update this line to match your username
+self.model = YOLO(
+    '/home/YOUR_USERNAME/Projects/ros_project1/models/yolov8s.pt',
+    task='detect')
 ```
 
 ---
@@ -205,54 +310,45 @@ docker run -it \
   bash
 ```
 
-#### 2. Inside the container — install dependencies
+#### 2. Inside container — install dependencies
 
 ```bash
 apt-get update
-apt-get install -y python3-pip python3-colcon-common-extensions ros-jazzy-std-msgs ros-jazzy-rosidl-default-generators
-pip install opencv-python-headless numpy RPi.GPIO --break-system-packages --ignore-installed numpy
+apt-get install -y \
+  python3-pip \
+  python3-colcon-common-extensions \
+  ros-jazzy-std-msgs \
+  ros-jazzy-rosidl-default-generators
+
+pip install opencv-python-headless numpy RPi.GPIO \
+  --break-system-packages --ignore-installed numpy
 ```
 
-#### 3. Set up workspace inside container
+#### 3. Build inside container
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-mkdir -p /home/ros_project1/ros2_ws/src
-
-# Copy package from laptop
-# Run this on the laptop:
-# scp -r ~/Projects/ros_project1/ros2_ws/src/pantilt_interfaces \
-#   pi@<rpi4-ip>:/home/pi/Projects/ros_project1/ros2_ws/src/
-# scp -r ~/Projects/ros_project1/ros2_ws/src/pantilt_tracker \
-#   pi@<rpi4-ip>:/home/pi/Projects/ros_project1/ros2_ws/src/
-```
-
-#### 4. Build inside container
-
-```bash
 cd /home/ros_project1/ros2_ws
 colcon build --symlink-install
 source install/setup.bash
 
-# Add to container ~/.bashrc
 echo "source /opt/ros/jazzy/setup.bash" >> ~/.bashrc
 echo "source /home/ros_project1/ros2_ws/install/setup.bash" >> ~/.bashrc
 echo "export ROS_DOMAIN_ID=30" >> ~/.bashrc
 ```
 
-#### 5. Subsequent sessions
+#### 4. Subsequent sessions
 
 ```bash
-# On RPi4 host
 docker start pantilt_ros
 docker exec -it pantilt_ros bash
 ```
 
 ---
 
-### Running the System
+## Running the System
 
-Open two terminals on RPi4 (inside Docker) and three on the laptop.
+### Core tracking (minimum required)
 
 **RPi4 — Terminal 1:**
 ```bash
@@ -279,38 +375,96 @@ ros2 run pantilt_tracker controller_node
 ros2 run pantilt_tracker viz_node
 ```
 
-### Verify Data Flow
+### LLM voice interface (optional)
+
+Ensure Ollama is running:
+```bash
+ollama serve
+```
+
+**Laptop — Terminal 4:**
+```bash
+ros2 run pantilt_tracker llm_node
+```
+
+**Laptop — Terminal 5 — choose one:**
+```bash
+# Voice input — speak commands naturally
+ros2 run pantilt_tracker voice_input_node
+
+# OR typed input
+ros2 run pantilt_tracker command_interface_node
+```
+
+### Verify data flow
 
 ```bash
-ros2 topic hz /camera/image/compressed   # ~20Hz
-ros2 topic hz /tracker/target_box        # ~20Hz
-ros2 topic hz /motor/cmd                 # ~20Hz
+ros2 topic hz /camera/image/compressed    # ~20Hz
+ros2 topic hz /tracker/target_box         # ~20Hz
+ros2 topic hz /motor/cmd                  # ~20Hz
+ros2 topic hz /tracker/scene_info         # ~20Hz
+ros2 topic echo /tracker/status           # TRACKING / SEARCHING / LOST
 ```
 
 ---
 
 ## Tuning
 
-All tuning parameters are constants at the top of `controller_node.py`:
+### PI Controller (`controller_node.py`)
 
 | Parameter | Default | Effect |
 |---|---|---|
-| `KP_PAN` | 0.08 | Pan motor proportional gain. Higher = faster response, too high = oscillation |
-| `KP_TILT` | 0.08 | Tilt motor proportional gain |
-| `KI_PAN` | 0.005 | Pan integral gain. Eliminates steady-state offset. Keep small for DC motors |
+| `KP_PAN` | 0.12 | Pan proportional gain. Higher = faster response, too high = oscillation |
+| `KP_TILT` | 0.20 | Tilt proportional gain |
+| `KI_PAN` | 0.005 | Pan integral gain. Eliminates steady-state offset |
 | `KI_TILT` | 0.002 | Tilt integral gain |
-| `DEADZONE_INNER` | 30 | Pixel radius where motor stops correcting. Prevents constant micro-corrections |
-| `DEADZONE_OUTER` | 60 | Pixel radius where full correction speed is applied |
-| `LOST_TIMEOUT` | 5.0 | Seconds before entering search sweep after losing target |
-| `SEARCH_SPEED` | 8.0 | Pan speed during search sweep. Set to 0.0 to disable search entirely |
+| `DEADZONE_INNER` | 25 | Pixel radius where motors stop correcting |
+| `DEADZONE_OUTER` | 50 | Pixel radius where full correction speed applies |
+| `LOST_TIMEOUT` | 2.0 | Seconds before entering search sweep after losing target |
+| `SEARCH_SPEED` | 12.0 | Pan speed during search sweep |
+
+### LLM Command Speeds (`controller_node.py`)
+
+| Key | Default | Effect |
+|---|---|---|
+| `slow` | 7.0 | Motor speed for "slowly", "gently" phrased commands |
+| `medium` | 13.0 | Default speed for directional commands |
+| `fast` | 25.0 | Motor speed for "fast", "quickly" phrased commands |
+
+### Voice Input (`voice_input_node.py`)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `WHISPER_MODEL` | `base` | `tiny` is faster, `small` is more accurate |
+| `VAD_AGGRESSIVENESS` | `2` | 0–3, higher = more aggressive background noise filtering |
+| `SILENCE_THRESHOLD` | `0.8` | Seconds of silence before clip is sent to Whisper |
+
+### Detection (`detector_node.py`)
+
+| Parameter | Default | Effect |
+|---|---|---|
+| `MIN_THRESH` | `0.45` | YOLO confidence threshold. Lower = more detections, more false positives |
+| `MOVEMENT_THRESHOLD` | `4.0` | Optical flow magnitude in pixels above which target is classified as moving |
 
 ---
 
 ## Known Limitations
 
-- DC geared motors have no position feedback (no encoders), so exact pixel-perfect centering is not achievable. The camera settles within approximately 30-40px of centre.
-- Camera streams at 20Hz over WiFi, which introduces approximately 80-120ms end-to-end latency. This is acceptable for person/face tracking but would be insufficient for fast-moving objects.
-- The mechanical structure built from Lego and cardboard introduces some physical play and flex, which affects tracking precision.
+- DC geared motors have no encoders so pixel-perfect centering is not achievable. The camera settles within approximately 25-40px of centre.
+- End-to-end latency is approximately 80-120ms from WiFi and JPEG compression. Acceptable for person tracking, insufficient for fast-moving small objects.
+- LLaVA commands take 2-4 seconds to process. During this time the camera continues its last behaviour.
+- YOLOv8s covers 80 COCO object classes. Objects outside these classes cannot be tracked regardless of voice command.
+- The mechanical structure built from Lego and cardboard introduces physical play that affects precision.
+
+---
+
+## Future Improvements
+
+- IMU (MPU6050) on the camera mount for precise angle-based movement ("turn exactly 90 degrees")
+- Wheel base for full mobile tracking
+- Wake word detection for hands-free activation
+- Person re-identification to track a specific individual across occlusions
+- Upgrade to YOLO11 for improved detection accuracy
 
 ---
 
