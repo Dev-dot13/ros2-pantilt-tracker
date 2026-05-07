@@ -1,0 +1,2 @@
+float32 pan_speed
+float32 tilt_speed
