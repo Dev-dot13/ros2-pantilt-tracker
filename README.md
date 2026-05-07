@@ -139,9 +139,9 @@ The current YOLO scene state (target class, detection status, count, movement, p
 ### Dynamic Target Switching
 
 The tracked object class can be changed at runtime by voice or typed command:
-follow that bottle      → YOLO switches from 'person' to 'bottle'
-track that chair        → YOLO switches to 'chair'
-go back to people       → YOLO switches back to 'person'
+follow that bottle      → YOLO switches from 'person' to 'bottle' <br>
+track that chair        → YOLO switches to 'chair' <br>
+go back to people       → YOLO switches back to 'person' <br>
 
 Any of the 80 COCO object classes that YOLOv8s was trained on can be used as a tracking target.
 
