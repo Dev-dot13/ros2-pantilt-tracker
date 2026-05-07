@@ -26,14 +26,14 @@ The key architectural decision is the **split between devices**: the camera stre
 ┌─────────────────────────────────────────────────────┐
 │                  LAPTOP (RTX 4060)                  │
 │                                                     │
-│   detector_node ──► controller_node ──► viz_node   │
+│   detector_node ──► controller_node ──► viz_node    │
 │        │                  │                         │
-│   YOLOv8 face         PI control +                  │
+│   YOLOv8              PI control +                  │
 │   inference +         search sweep                  │
 │   optical flow                                      │
-└────────────┬──────────────┬────────────────────────┘
+└────────────┬──────────────┬─────────────────────────┘
              │ WiFi (DDS)   │ WiFi (DDS)
-┌────────────▼──────────────▼────────────────────────┐
+┌────────────▼──────────────▼─────────────────────────┐
 │              RASPBERRY PI 4 (Docker)                │
 │                                                     │
 │        camera_node          motor_driver_node       │
@@ -57,7 +57,7 @@ The key architectural decision is the **split between devices**: the camera stre
 
 **`camera_node`** — Runs on RPi4. Captures frames from the USB camera, JPEG-compresses them, and publishes at 20Hz. Keeps bandwidth low by sending compressed images instead of raw frames.
 
-**`detector_node`** — Runs on laptop. Subscribes to compressed frames, runs YOLOv8 face detection on every frame using the GPU, tracks the detected face across frames using IoU matching and Lucas-Kanade optical flow between inference frames, then publishes the bounding box.
+**`detector_node`** — Runs on laptop. Subscribes to compressed frames, runs YOLOv8 detection on every frame using the GPU, tracks the detected face across frames using IoU matching and Lucas-Kanade optical flow between inference frames, then publishes the bounding box.
 
 **`controller_node`** — Runs on laptop. Receives the bounding box, computes pan and tilt pixel errors relative to the frame centre, applies a soft deadzone and PI control law, and publishes motor speed commands. Also handles the search sweep state machine when no face is detected.
 
@@ -176,14 +176,14 @@ echo "source ~/Projects/ros_project1/ros2_ws/install/setup.bash" >> ~/.bashrc
 ```bash
 mkdir -p ~/Projects/ros_project1/models
 cd ~/Projects/ros_project1/models
-wget https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n-face.pt
+wget https://github.com/akanametov/yolo-face/releases/download/v0.0.0/yolov8n.pt
 ```
 
 #### 5. Update model path in detector_node.py
 
 ```python
 # In detector_node.py, update this line to your actual path
-self.model = YOLO('/home/YOUR_USERNAME/Projects/ros_project1/models/yolov8n-face.pt', task='detect')
+self.model = YOLO('/home/YOUR_USERNAME/Projects/ros_project1/models/yolov8n.pt', task='detect')
 ```
 
 ---
