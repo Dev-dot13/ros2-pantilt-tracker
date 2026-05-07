@@ -148,7 +148,7 @@ export ROS_DOMAIN_ID=30
 Install PyTorch with CUDA (get exact command for your CUDA version from pytorch.org):
 
 ```bash
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --break-system-packages
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 --break-system-packages
 pip install ultralytics opencv-python numpy --break-system-packages
 ```
 
