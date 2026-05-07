@@ -25,8 +25,8 @@ The system has two layers of intelligence:
 ---
 
 ## Architecture
-
-┌──────────────────────────────────────────────────────────────────┐
+```
+┌──────────────────────────────────────────────────────────────────┐ 
 │                        LAPTOP (RTX 4060)                         │
 │                                                                  │
 │  voice_input_node                                                │
@@ -58,7 +58,7 @@ The system has two layers of intelligence:
 │     compressed JPEG                  DRV8833 driver              │
 │        streaming                     Pan + Tilt motors           │
 └──────────────────────────────────────────────────────────────────┘
-
+```
 ### ROS2 Topics
 
 | Topic | Message Type | Publisher | Subscribers |
