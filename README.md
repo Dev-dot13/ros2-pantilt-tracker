@@ -192,6 +192,7 @@ Any of the 80 COCO object classes that YOLOv8s was trained on can be used as a t
 - RPi.GPIO
 
 ### Repository Structure
+```
 ros2_ws/src/
 ├── pantilt_interfaces/            # Custom message definitions
 │   ├── msg/
@@ -215,7 +216,7 @@ ros2_ws/src/
 ├── package.xml
 ├── setup.cfg
 └── setup.py
-
+```
 ---
 
 ## Setup Guide
