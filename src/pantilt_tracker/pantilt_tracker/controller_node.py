@@ -8,10 +8,10 @@ import time
 
 # --- PI control constants --- tuned for yolov8s responsiveness
 KP_PAN         = 0.09
-KP_TILT        = 0.16
+KP_TILT        = 0.10
 KI_PAN         = 0.005
-KI_TILT        = 0.002
-DEADZONE_INNER = 25
+KI_TILT        = 0.0
+DEADZONE_INNER = 30
 DEADZONE_OUTER = 50
 INTEGRAL_CLAMP = 15.0
 

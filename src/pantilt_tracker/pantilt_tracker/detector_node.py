@@ -6,6 +6,7 @@ from std_msgs.msg import String
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import json
 
 DEFAULT_TARGET   = 'person'
 FRAME_SKIP       = 1
@@ -48,7 +49,7 @@ class DetectorNode(Node):
 
         # Load YOLO model
         self.model = YOLO(
-            '/home/devdatt-sonkusare/Projects/ros_project1/models/yolov8s.pt',
+            '/home/devdatt-sonkusare/Projects/ros_project1/models/yolo26s.pt',
             task='detect')
         self.labels      = self.model.names
         self.label_to_id = {v.lower(): k for k, v in self.labels.items()}
@@ -106,6 +107,18 @@ class DetectorNode(Node):
                 reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT)
         )
 
+        # Region hint from llm_node — used for attribute-based lock-on
+        self.region_hint      = None   # 'left', 'center', 'right'
+        self.region_hint_target = None
+        self.region_hint_type   = None  # 'lock_region' or 'reselect_direction'
+
+        self.create_subscription(
+            String,
+            '/tracker/region_hint',
+            self.region_hint_callback,
+            10
+        )
+
         self.get_logger().info("DetectorNode ready.")
 
     # ------------------------------------------------------------------
@@ -127,6 +140,27 @@ class DetectorNode(Node):
     # ------------------------------------------------------------------
     # Main image callback
     # ------------------------------------------------------------------
+
+    def region_hint_callback(self, msg: String):
+        try:
+            hint = json.loads(msg.data)
+            self.region_hint_type   = hint.get('type')
+            self.region_hint        = hint.get('region', None)
+            self.region_hint_target = hint.get('target', self.current_target)
+
+            # Switch target class if needed
+            if (self.region_hint_target and
+                    self.region_hint_target != self.current_target and
+                    self.region_hint_target in self.label_to_id):
+                self.current_target = self.region_hint_target
+                self.tracked_box    = None
+                self.of_active      = False
+
+            self.get_logger().info(
+                f'Region hint received: type={self.region_hint_type} '
+                f'region={self.region_hint} target={self.region_hint_target}')
+        except Exception as e:
+            self.get_logger().warn(f'Region hint parse error: {e}')
 
     def image_callback(self, msg: CompressedImage):
         np_arr = np.frombuffer(msg.data, np.uint8)
@@ -157,7 +191,27 @@ class DetectorNode(Node):
             self.person_count = len(candidates)
 
             if candidates:
-                if self.tracked_box is None:
+                if self.region_hint is not None:
+                    # LLaVA identified a region — lock onto best box there
+                    chosen = self._pick_box_in_region(
+                        candidates, self.region_hint,
+                        self.region_hint_type)
+                    if chosen:
+                        self.tracked_box = chosen
+                        self.get_logger().info(
+                            f'Locked onto box in region: {self.region_hint}')
+                    else:
+                        self.get_logger().warn(
+                            f'No box found in region {self.region_hint} '
+                            f'— using largest.')
+                        self.tracked_box = max(
+                            candidates,
+                            key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
+                    # Consume hint — only applied once
+                    self.region_hint      = None
+                    self.region_hint_type = None
+
+                elif self.tracked_box is None:
                     self.tracked_box = max(
                         candidates,
                         key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
@@ -314,6 +368,43 @@ class DetectorNode(Node):
     # ------------------------------------------------------------------
     # Optical flow
     # ------------------------------------------------------------------
+
+    def _pick_box_in_region(self, candidates, region, hint_type):
+        """
+        Pick the best candidate box in the specified frame region.
+        For lock_region: pick largest box whose centre falls in region.
+        For reselect_direction: pick largest box that is left/right
+        of the current tracked box centre.
+        """
+        frame_third = 640 // 3
+
+        if hint_type == 'reselect_direction' and self.tracked_box is not None:
+            # Find boxes to the left or right of current tracked box
+            current_cx = (self.tracked_box[0] + self.tracked_box[2]) // 2
+            filtered = []
+            for box in candidates:
+                box_cx = (box[0] + box[2]) // 2
+                if region == 'left'  and box_cx < current_cx:
+                    filtered.append(box)
+                elif region == 'right' and box_cx > current_cx:
+                    filtered.append(box)
+        else:
+            # lock_region — filter by absolute frame region
+            filtered = []
+            for box in candidates:
+                cx = (box[0] + box[2]) // 2
+                if region == 'left'   and cx < frame_third:
+                    filtered.append(box)
+                elif region == 'center' and frame_third <= cx <= frame_third * 2:
+                    filtered.append(box)
+                elif region == 'right'  and cx > frame_third * 2:
+                    filtered.append(box)
+
+        if not filtered:
+            return None
+
+        # Return largest box in filtered set
+        return max(filtered, key=lambda b: (b[2]-b[0])*(b[3]-b[1]))
 
     def _flow_update(self, prev_gray, curr_gray, prev_pts, prev_box):
         if prev_pts is None or len(prev_pts) == 0:

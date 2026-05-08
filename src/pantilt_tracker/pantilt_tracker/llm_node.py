@@ -7,6 +7,8 @@ import base64
 import json
 import threading
 
+from pantilt_tracker.intent_parser import parse as parse_intent
+
 
 class LLMNode(Node):
 
@@ -36,7 +38,6 @@ class LLMNode(Node):
             String, '/llm/command',
             self.command_callback, 10)
 
-        # Scene info from YOLO — used to enrich LLaVA context
         self.scene_sub = self.create_subscription(
             String, '/tracker/scene_info',
             self.scene_callback, 10)
@@ -48,19 +49,23 @@ class LLMNode(Node):
             String, '/llm/response', 10)
         self.target_pub   = self.create_publisher(
             String, '/tracker/set_target', 10)
+        self.region_pub   = self.create_publisher(
+            String, '/tracker/region_hint', 10)
 
         # --- State ---
         self.latest_frame           = None
         self.latest_annotated_frame = None
         self.frame_lock             = threading.Lock()
         self.llava_busy             = False
-
-        # Latest YOLO scene info — passed to LLaVA as context
-        self.latest_scene_info = {}
+        self.latest_scene_info      = {}
 
         self.ollama_url = 'http://localhost:11434/api/generate'
 
-        self.get_logger().info('LLM Node ready — LLaVA on-demand via /llm/command')
+        self.get_logger().info('LLM Node ready.')
+        self.get_logger().info(
+            '  Intent parser handles all direct commands instantly.')
+        self.get_logger().info(
+            '  LLaVA invoked only for visual grounding.')
 
     # ------------------------------------------------------------------
     # Frame and scene ingestion
@@ -89,8 +94,24 @@ class LLMNode(Node):
         if not command:
             return
 
+        # Parse intent instantly — no model needed
+        intent = parse_intent(command)
+        self.get_logger().info(
+            f'Intent: action={intent["action"]} '
+            f'target={intent["target"]} '
+            f'direction={intent["direction"]} '
+            f'needs_visual={intent["needs_visual"]} '
+            f'attribute={intent["attribute"]}'
+        )
+
+        # If no visual grounding needed — dispatch immediately
+        if not intent['needs_visual']:
+            self._dispatch_intent(intent)
+            return
+
+        # Visual grounding needed — invoke LLaVA
         if self.llava_busy:
-            self.get_logger().warn(f'LLaVA busy — retrying in 3s: "{command}"')
+            self.get_logger().warn('LLaVA busy — retrying in 3s.')
             timer = threading.Timer(3.0, self.command_callback, args=[msg])
             timer.daemon = True
             timer.start()
@@ -101,196 +122,179 @@ class LLMNode(Node):
                 frame_data = bytes(self.latest_annotated_frame)
             elif self.latest_frame is not None:
                 frame_data = bytes(self.latest_frame)
-                self.get_logger().warn('Using raw frame — annotated not yet available.')
             else:
                 self.get_logger().warn('No frame available.')
                 return
 
-        self.get_logger().info(f'Command: "{command}"')
         thread = threading.Thread(
-            target=self._query_llava,
-            args=(frame_data, command),
+            target=self._query_llava_for_grounding,
+            args=(frame_data, intent),
             daemon=True
         )
         thread.start()
 
     # ------------------------------------------------------------------
-    # LLaVA
+    # Direct dispatch — no LLaVA needed
     # ------------------------------------------------------------------
 
-    def _query_llava(self, frame_data, command):
+    def _dispatch_intent(self, intent):
+        action = intent['action']
+
+        if action == 'CHANGE_TARGET':
+            t_msg      = String()
+            t_msg.data = intent['target']
+            self.target_pub.publish(t_msg)
+            # Also reset controller to TRACK
+            cmd = {'action': 'TRACK', 'direction': None,
+                   'speed': 'medium', 'duration': 0,
+                   'until_detection': False}
+            self._publish_command(cmd)
+            self._publish_response(f"Now tracking: {intent['target']}")
+            self.get_logger().info(
+                f"Target changed to: {intent['target']}")
+            return
+
+        if action == 'RESELECT':
+            # No attribute — reselect by direction among current boxes
+            region_msg      = String()
+            region_msg.data = json.dumps({
+                'type':      'reselect_direction',
+                'direction': intent['direction'],
+                'target':    intent['target'] or 'person'
+            })
+            self.region_pub.publish(region_msg)
+            self.get_logger().info(
+                f"Reselect by direction: {intent['direction']}")
+            return
+
+        if action == 'RESPOND':
+            # Should not reach here without visual — fallback
+            self._publish_response(
+                "I need to see the scene to answer that.")
+            return
+
+        # All motor actions — map intent to controller command
+        cmd = {
+            'action':          action,
+            'direction':       intent['direction'],
+            'speed':           intent['speed'],
+            'duration':        intent['duration'],
+            'until_detection': intent['until_detection'],
+        }
+        self._publish_command(cmd)
+        self.get_logger().info(f'Dispatched: {cmd}')
+
+    # ------------------------------------------------------------------
+    # LLaVA — visual grounding only
+    # ------------------------------------------------------------------
+
+    def _query_llava_for_grounding(self, frame_data, intent):
         self.llava_busy = True
         try:
             image_b64 = base64.b64encode(frame_data).decode('utf-8')
+            action    = intent['action']
+            attribute = intent['attribute'] or ''
+            target    = intent['target'] or 'person'
 
-            # Include YOLO scene context in the prompt
-            scene = self.latest_scene_info
-            scene_context = (
-                f"Current YOLO detection state: "
-                f"target='{scene.get('target', 'person')}', "
-                f"detected={scene.get('target_detected', False)}, "
-                f"count={scene.get('target_count', 0)}, "
-                f"moving={scene.get('is_moving', False)}, "
-                f"position='{scene.get('position', 'unknown')}'."
-            )
+            # Build a single focused visual question — not a command
+            if action == 'RESPOND':
+                question = intent['raw']
+                prompt = (
+                    f"Look at this camera frame carefully. "
+                    f"Answer this question concisely in one or two sentences: "
+                    f"{question}"
+                )
+            elif action in ('RESELECT', 'FIND'):
+                prompt = (
+                    f"Look at this camera frame. "
+                    f"I am looking for a {target} with this attribute: {attribute}. "
+                    f"In which region of the frame is this {target} most likely located? "
+                    f"Reply with exactly one word: left, center, right, or notfound."
+                )
+            else:
+                prompt = (
+                    f"Look at this camera frame. "
+                    f"Is there a {target} with this attribute: {attribute}? "
+                    f"Reply with exactly one word: left, center, right, or notfound."
+                )
 
-            llava_prompt = f"""You are the brain of a pan-tilt camera tracking system.
-The camera can physically move left/right (pan) and up/down (tilt) using DC motors.
-It uses YOLO for object detection and tracking.
-
-{scene_context}
-
-The user said: "{command}"
-
-Look at the current annotated camera frame carefully. Green box = currently tracked object.
-Red crosshair = where the tracker is aimed. Blue boxes = other detected objects.
-
-Respond with ONLY a raw JSON object. No markdown, no explanation, just JSON.
-
-Use this exact structure:
-{{
-  "action": one of ["TRACK", "STOP", "PAN", "TILT", "LOCK", "FIND", "SEARCH", "RESPOND", "CHANGE_TARGET"],
-  "target": "object class name if CHANGE_TARGET, else null",
-  "direction": one of ["left", "right", "up", "down", null],
-  "speed": one of ["slow", "medium", "fast"],
-  "duration": number in seconds (2.0 for simple moves, 0 if until_detection is true),
-  "until_detection": true or false,
-  "response_text": "conversational reply if RESPOND, else null",
-  "reason": "one sentence explanation"
-}}
-
-Action guide:
-- TRACK: resume normal tracking
-- STOP: stop motors, hold position
-- PAN: move left or right
-- TILT: move up or down
-- LOCK: freeze motors AND ignore detections until next command
-- FIND: aggressive search until target centred
-- SEARCH: slow sweep
-- RESPOND: answer question, no motor movement
-- CHANGE_TARGET: switch YOLO to track a different object class
-
-Examples:
-"look right" -> {{"action":"PAN","target":null,"direction":"right","speed":"medium","duration":2.0,"until_detection":false,"response_text":null,"reason":"pan right"}}
-"look left" -> {{"action":"PAN","target":null,"direction":"left","speed":"medium","duration":2.0,"until_detection":false,"response_text":null,"reason":"pan left"}}
-"pan left slowly" -> {{"action":"PAN","target":null,"direction":"left","speed":"slow","duration":2.0,"until_detection":false,"response_text":null,"reason":"slow pan left"}}
-"look up" -> {{"action":"TILT","target":null,"direction":"up","speed":"medium","duration":2.0,"until_detection":false,"response_text":null,"reason":"tilt up"}}
-"look down" -> {{"action":"TILT","target":null,"direction":"down","speed":"medium","duration":2.0,"until_detection":false,"response_text":null,"reason":"tilt down"}}
-"look up slowly" -> {{"action":"TILT","target":null,"direction":"up","speed":"slow","duration":2.0,"until_detection":false,"response_text":null,"reason":"slow tilt up"}}
-"look down fast" -> {{"action":"TILT","target":null,"direction":"down","speed":"fast","duration":2.0,"until_detection":false,"response_text":null,"reason":"fast tilt down"}}
-"look right until you find someone" -> {{"action":"PAN","target":null,"direction":"right","speed":"slow","duration":0,"until_detection":true,"response_text":null,"reason":"pan until detected"}}
-"look up until you find someone" -> {{"action":"TILT","target":null,"direction":"up","speed":"slow","duration":0,"until_detection":true,"response_text":null,"reason":"tilt until detected"}}
-"find me" -> {{"action":"FIND","target":null,"direction":null,"speed":"fast","duration":0,"until_detection":true,"response_text":null,"reason":"search for user"}}
-"stop" -> {{"action":"STOP","target":null,"direction":null,"speed":"medium","duration":0,"until_detection":false,"response_text":null,"reason":"stop motors"}}
-"stay there" -> {{"action":"LOCK","target":null,"direction":null,"speed":"medium","duration":0,"until_detection":false,"response_text":null,"reason":"lock position"}}
-"start tracking" -> {{"action":"TRACK","target":null,"direction":null,"speed":"medium","duration":0,"until_detection":false,"response_text":null,"reason":"resume tracking"}}
-"who do you see?" -> {{"action":"RESPOND","target":null,"direction":null,"speed":"medium","duration":0,"until_detection":false,"response_text":"I can see...","reason":"answer question"}}
-"what do you see?" -> {{"action":"RESPOND","target":null,"direction":null,"speed":"medium","duration":0,"until_detection":false,"response_text":"I can see...","reason":"answer question"}}
-"follow that bottle" -> {{"action":"CHANGE_TARGET","target":"bottle","direction":null,"speed":"medium","duration":0,"until_detection":false,"response_text":null,"reason":"track bottle"}}
-"go back to following people" -> {{"action":"CHANGE_TARGET","target":"person","direction":null,"speed":"medium","duration":0,"until_detection":false,"response_text":null,"reason":"resume person tracking"}}
-"""
-
-            self.get_logger().info('LLaVA thinking...')
+            self.get_logger().info(
+                f'LLaVA grounding query: "{prompt[:80]}..."')
 
             response = requests.post(self.ollama_url, json={
-                'model': 'llava:7b',
-                'prompt': llava_prompt,
-                'images': [image_b64],
-                'stream': False,
+                'model':      'llava:7b',
+                'prompt':     prompt,
+                'images':     [image_b64],
+                'stream':     False,
                 'keep_alive': 0
             }, timeout=30)
 
             if response.status_code == 200:
-                raw      = response.json().get('response', '').strip()
-                self.get_logger().info(f'LLaVA raw: {raw}')
-                decision = self._parse_llava(raw)
-                self.get_logger().info(f'LLaVA decision: {decision}')
-                self._dispatch(decision)
+                raw = response.json().get('response', '').strip().lower()
+                self.get_logger().info(f'LLaVA grounding answer: "{raw}"')
+
+                if action == 'RESPOND':
+                    self._publish_response(raw)
+                    return
+
+                # Extract region from answer
+                region = None
+                for r in ('left', 'center', 'right', 'centre'):
+                    if r in raw:
+                        region = 'center' if r == 'centre' else r
+                        break
+
+                if region is None or 'notfound' in raw or 'not found' in raw:
+                    self.get_logger().info(
+                        f'Attribute "{attribute}" not found in frame.')
+                    self._publish_response(
+                        f"I cannot see a {target} with {attribute} "
+                        f"in the current frame.")
+                    return
+
+                self.get_logger().info(
+                    f'Grounding result: {target} with '
+                    f'"{attribute}" found at: {region}')
+
+                # Publish region hint to detector_node
+                hint_msg      = String()
+                hint_msg.data = json.dumps({
+                    'type':   'lock_region',
+                    'region': region,
+                    'target': target
+                })
+                self.region_pub.publish(hint_msg)
+
+                # Confirm to user
+                self._publish_response(
+                    f"Found {target} with {attribute} on the {region}. "
+                    f"Locking on.")
+
             else:
-                self.get_logger().error(f'LLaVA HTTP error: {response.status_code}')
+                self.get_logger().error(
+                    f'LLaVA HTTP error: {response.status_code}')
 
         except requests.exceptions.Timeout:
-            self.get_logger().error('LLaVA timed out.')
+            self.get_logger().error('LLaVA grounding timed out.')
         except Exception as e:
-            self.get_logger().error(f'LLaVA failed: {e}')
+            self.get_logger().error(f'LLaVA grounding failed: {e}')
         finally:
             self.llava_busy = False
             self.get_logger().info('LLaVA done.')
 
-    def _dispatch(self, decision):
-        action = decision.get('action')
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-        if action == 'RESPOND':
-            reply = decision.get('response_text', '')
-            if reply:
-                msg      = String()
-                msg.data = reply
-                self.response_pub.publish(msg)
-                self.get_logger().info(f'LLaVA says: {reply}')
+    def _publish_command(self, cmd: dict):
+        msg      = String()
+        msg.data = json.dumps(cmd)
+        self.command_pub.publish(msg)
 
-        elif action == 'CHANGE_TARGET':
-            new_target = (decision.get('target') or '').strip().lower()
-            if new_target:
-                t_msg      = String()
-                t_msg.data = new_target
-                self.target_pub.publish(t_msg)
-                # Resume TRACK after switching
-                decision['action'] = 'TRACK'
-                cmd_msg            = String()
-                cmd_msg.data       = json.dumps(decision)
-                self.command_pub.publish(cmd_msg)
-                # Confirm to user
-                r_msg      = String()
-                r_msg.data = f'Now tracking: {new_target}'
-                self.response_pub.publish(r_msg)
-            else:
-                self.get_logger().warn('CHANGE_TARGET with no target specified.')
-
-        else:
-            cmd_msg      = String()
-            cmd_msg.data = json.dumps(decision)
-            self.command_pub.publish(cmd_msg)
-
-    def _parse_llava(self, raw):
-        cleaned = raw.strip()
-        if '```' in cleaned:
-            lines   = cleaned.split('\n')
-            cleaned = '\n'.join(
-                l for l in lines if not l.strip().startswith('```'))
-        start = cleaned.find('{')
-        end   = cleaned.rfind('}')
-        if start != -1 and end != -1:
-            cleaned = cleaned[start:end+1]
-
-        try:
-            decision = json.loads(cleaned)
-        except json.JSONDecodeError:
-            self.get_logger().warn('JSON parse failed — STOP fallback.')
-            decision = {}
-
-        valid_actions    = [
-            'TRACK','STOP','PAN','TILT','LOCK',
-            'FIND','SEARCH','RESPOND','CHANGE_TARGET']
-        valid_directions = ['left','right','up','down', None]
-        valid_speeds     = ['slow','medium','fast']
-
-        decision['action']          = decision.get('action', 'STOP')
-        decision['target']          = decision.get('target', None)
-        decision['direction']       = decision.get('direction', None)
-        decision['speed']           = decision.get('speed', 'medium')
-        decision['duration']        = float(decision.get('duration', 2.0))
-        decision['until_detection'] = bool(decision.get('until_detection', False))
-        decision['response_text']   = decision.get('response_text', None)
-        decision['reason']          = decision.get('reason', '')
-
-        if decision['action']    not in valid_actions:
-            decision['action']    = 'STOP'
-        if decision['direction'] not in valid_directions:
-            decision['direction'] = None
-        if decision['speed']     not in valid_speeds:
-            decision['speed']     = 'medium'
-
-        return decision
+    def _publish_response(self, text: str):
+        msg      = String()
+        msg.data = text
+        self.response_pub.publish(msg)
 
 
 def main(args=None):
@@ -303,3 +307,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
