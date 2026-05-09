@@ -18,46 +18,56 @@ When a target object enters the camera frame, the system detects it using YOLOv8
 
 The system has two layers of intelligence:
 
-**Layer 1 — YOLO tracking (always running):** The camera streams compressed JPEG frames over WiFi to the laptop, where GPU-accelerated YOLOv8s inference runs at 20Hz. Lucas-Kanade optical flow fills in between inference frames. Only bounding box coordinates and scene metadata travel to the controller — a tiny fraction of the bandwidth raw video would require. Movement detection is derived directly from optical flow displacement magnitude.
+**Layer 1 — YOLO tracking (always running):** The camera streams compressed JPEG frames over WiFi to the laptop, where GPU-accelerated YOLOv8s inference runs at 20Hz. Lucas-Kanade optical flow fills in between inference frames. Only bounding box coordinates and scene metadata travel to the controller. Movement detection is derived directly from optical flow displacement magnitude.
 
-**Layer 2 — LLM command layer (on-demand):** A locally running LLaVA 7B vision-language model receives natural language commands — typed or spoken — and translates them into precise motor actions. LLaVA sees the YOLO-annotated frame (with bounding boxes and labels already drawn) giving it grounded scene understanding. Commands are interpreted in natural language and executed immediately.
+**Layer 2 — LLM command layer (on-demand):** Natural language commands are parsed instantly by a rule-based intent parser with zero model overhead. LLaVA 7B is invoked only when visual grounding is genuinely needed — for example, identifying which person is wearing a red jacket, or confirming a specific object's position in the frame. For all other commands, the intent parser dispatches directly to the controller with no LLM involved.
 
 ---
 
 ## Architecture
 ```
-┌──────────────────────────────────────────────────────────────────┐ 
-│                        LAPTOP (RTX 4060)                         │
-│                                                                  │
-│  voice_input_node                                                │
-│       │ (Whisper STT)                                            │
-│       ▼                                                          │
-│  command_interface_node ──► /llm/command ──► llm_node            │
-│                                               │  (LLaVA 7B)      │
-│                                               ▼                  │
-│  detector_node ──► controller_node ◄── /tracker/llm_command      │
-│       │    │            │                                        │
-│  YOLOv8s   │        PI control +                                 │
-│  inference │        LLaVA command                                │
-│  + optical │        layer                                        │
-│  flow      │                                                     │
-│            ▼                                                     │
-│     /camera/image/annotated ──► llm_node (LLaVA context)         │
-│     /tracker/scene_info     ──► controller_node                  │
-│                                 (movement + count from YOLO)     │
-│                                                                  │
-│                         viz_node                                 │
-└──────────────┬──────────────────┬────────────────────────────────┘
-│ WiFi (DDS)       │ WiFi (DDS)
-┌──────────────▼──────────────────▼────────────────────────────────┐
-│                    RASPBERRY PI 4 (Docker)                       │
-│                                                                  │
-│         camera_node                  motor_driver_node           │
-│              │                              │                    │
-│        USB camera                    GPIO + PWM                  │
-│     compressed JPEG                  DRV8833 driver              │
-│        streaming                     Pan + Tilt motors           │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                          LAPTOP (RTX 4060)                           │
+│                                                                      │
+│  command_interface_node                                              │
+│       │ (typed commands)                                             │
+│       ▼                                                              │
+│    /llm/command ──► llm_node                                         │
+│                       │                                              │
+│                  intent_parser                                       │
+│                  (instant, no model)                                 │
+│                       │                                              │
+│              needs_visual?                                           │
+│               ↓          ↓                                           │
+│              YES          NO                                         │
+│               ↓          ↓                                           │
+│           LLaVA 7B    dispatch                                       │
+│       (one focused    directly                                       │
+│        visual Q)          │                                          │
+│               ↓           │                                          │
+│         region_hint        │                                         │
+│               ↓           ↓                                          │
+│  detector_node ──────► controller_node                               │
+│       │    │                  │                                      │
+│  YOLOv8s   │             PI control +                                │
+│  inference │             LLaVA command layer                         │
+│  + optical │                                                         │
+│    flow    ▼                                                         │
+│     /camera/image/annotated ──► llm_node (LLaVA visual context)     │
+│     /tracker/scene_info     ──► controller_node                      │
+│                                                                      │
+│                           viz_node                                   │
+└──────────────┬────────────────────┬─────────────────────────────────┘
+│ WiFi (DDS)         │ WiFi (DDS)
+┌──────────────▼────────────────────▼─────────────────────────────────┐
+│                      RASPBERRY PI 4 (Docker)                        │
+│                                                                      │
+│           camera_node                    motor_driver_node           │
+│                │                                │                   │
+│          USB camera                      GPIO + PWM                  │
+│       compressed JPEG                    DRV8833 driver              │
+│          streaming                       Pan + Tilt motors           │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 ### ROS2 Topics
 
@@ -68,25 +78,28 @@ The system has two layers of intelligence:
 | `/tracker/target_box` | `pantilt_interfaces/BoundingBox` | `detector_node` | `controller_node`, `viz_node` |
 | `/tracker/scene_info` | `std_msgs/String` (JSON) | `detector_node` | `controller_node`, `llm_node` |
 | `/tracker/set_target` | `std_msgs/String` | `llm_node` | `detector_node` |
+| `/tracker/region_hint` | `std_msgs/String` (JSON) | `llm_node` | `detector_node` |
 | `/tracker/llm_command` | `std_msgs/String` (JSON) | `llm_node` | `controller_node` |
 | `/tracker/status` | `std_msgs/String` | `controller_node` | `viz_node` |
 | `/motor/cmd` | `pantilt_interfaces/MotorCmd` | `controller_node` | `motor_driver_node` |
-| `/llm/command` | `std_msgs/String` | `voice_input_node` / `command_interface_node` | `llm_node` |
-| `/llm/response` | `std_msgs/String` | `llm_node` | `voice_input_node` / `command_interface_node` |
+| `/llm/command` | `std_msgs/String` | `command_interface_node` | `llm_node` |
+| `/llm/response` | `std_msgs/String` | `llm_node` | `command_interface_node` |
 
 ### Node Descriptions
 
 **`camera_node`** — Runs on RPi4. Captures frames from the USB camera, JPEG-compresses them, and publishes at 20Hz.
 
-**`detector_node`** — Runs on laptop. Runs YOLOv8s detection on every frame using the GPU. Tracks the detected target across frames using IoU matching and Lucas-Kanade optical flow between inference frames. Derives movement detection from optical flow displacement magnitude. Publishes the bounding box, an annotated frame with boxes and labels drawn, and a JSON scene info message containing target count, movement state, and position.
+**`detector_node`** — Runs on laptop. Runs YOLOv8s detection on every frame using the GPU. Tracks the detected target across frames using IoU matching and Lucas-Kanade optical flow between inference frames. Derives movement detection from optical flow displacement magnitude. Publishes the bounding box, an annotated frame with boxes and labels drawn, and a JSON scene info message containing target count, movement state, and position. Accepts dynamic target class changes via `/tracker/set_target` and region-based lock-on hints via `/tracker/region_hint`.
 
-**`controller_node`** — Runs on laptop. Receives the bounding box and applies a soft deadzone and PI control law to drive motor speed commands. Subscribes to YOLO-derived scene info for movement-based motor modulation. Subscribes to LLaVA command decisions and executes them — supporting TRACK, STOP, PAN, TILT, LOCK, FIND, and SEARCH modes. Timed commands expire automatically and resume normal tracking.
+**`controller_node`** — Runs on laptop. Receives the bounding box and applies a soft deadzone and PI control law to drive motor speed commands. Subscribes to YOLO-derived scene info for movement-based motor modulation. Executes LLaVA command decisions supporting TRACK, STOP, PAN, TILT, LOCK, FIND, SEARCH, and RESELECT modes. Timed commands expire automatically and resume normal tracking.
 
-**`llm_node`** — Runs on laptop. Receives natural language commands on `/llm/command`. Passes the YOLO-annotated frame and current scene context to LLaVA 7B running locally via Ollama. Parses LLaVA's JSON decision and dispatches motor commands, target changes, or text responses. Handles CHANGE_TARGET by publishing the new object class to `/tracker/set_target`.
+**`llm_node`** — Runs on laptop. Receives natural language commands on `/llm/command`. Passes every command through the intent parser first. If no visual grounding is needed the intent is dispatched directly to the controller with zero model latency. LLaVA 7B is invoked only when the command contains a visual attribute (colour, clothing, specific appearance) that YOLO cannot resolve. LLaVA is asked one focused question and returns a region (left/center/right) used to lock YOLO onto the correct target.
 
-**`voice_input_node`** — Runs on laptop. Continuously listens to the microphone using voice activity detection (webrtcvad). When speech is detected and silence follows, transcribes the audio clip using faster-whisper (Whisper base, GPU-accelerated). Publishes the transcript to `/llm/command` and prints LLaVA responses from `/llm/response`.
+**`intent_parser`** — Not a node. A pure Python module imported by `llm_node`. Parses natural language commands into structured intent dicts instantly with no model. Handles movement, tracking, target switching, reselection, and search commands. Sets `needs_visual: True` only when a colour or clothing attribute is detected in the command.
 
-**`command_interface_node`** — Runs on laptop. Typed terminal alternative to voice input. Publishes typed commands to `/llm/command` and prints LLaVA responses from `/llm/response`.
+**`command_interface_node`** — Runs on laptop. Typed terminal interface. Publishes typed commands to `/llm/command` and prints responses from `/llm/response`.
+
+**`voice_input_node`** — Work in progress. Will provide continuous microphone listening with voice activity detection and Whisper-based speech-to-text, publishing transcripts to `/llm/command`.
 
 **`motor_driver_node`** — Runs on RPi4. Receives motor speed commands and drives two DC geared motors via PWM through a DRV8833 motor driver. Includes a watchdog timer that stops the motors if no command is received for over 1 second.
 
@@ -96,54 +109,66 @@ The system has two layers of intelligence:
 
 ## LLM Intelligence Layer
 
-### Models
+### Design Philosophy
 
-| Model | Purpose | Runs when | VRAM usage |
-|---|---|---|---|
-| LLaVA 7B (4-bit) | Command understanding, scene reasoning, question answering | On-demand only | ~5.2 GB, unloads after each call |
-| Whisper base | Speech-to-text transcription | When speech detected | ~200 MB |
-| YOLOv8s | Object detection and tracking | Every frame at 20Hz | ~200 MB |
+Each component does only what it is best at. No single model handles everything.
 
-### Supported Commands
+| Component | Job | Latency |
+|---|---|---|
+| Intent parser | Understand natural language commands | ~0ms, no model |
+| YOLO | Detect and locate objects | Per frame at 20Hz |
+| PI controller | Drive motors | Per frame at 20Hz |
+| LLaVA 7B | Answer one focused visual question | 2-4s, only when needed |
+| Whisper base | Speech to text | On speech detection (WIP) |
 
-Commands are spoken or typed in plain English. Examples:
+### When LLaVA Is and Is Not Invoked
 
-**Movement:**
-look to your right
+**LLaVA NOT invoked (intent parser handles directly):**
+look right / left / up / down
 pan left slowly
-look up
-tilt down fast
-look right until you find someone
-look up until you find someone
-
-**Tracking:**
-find me
-start tracking
 stop
 stay there
+find me
 follow that bottle
-go back to following people
+track the chair
+start tracking
+look right until you find someone
+focus on the person on the left
 
-**Awareness:**
+**LLaVA invoked (visual grounding needed):**
+follow the person in the red jacket
+track the one holding the bag
+find the blue chair
 who do you see?
 what do you see?
-how many people are visible?
-describe the scene
 
-### How LLaVA Understands the Scene
+### How LLaVA Is Used
 
-LLaVA receives the YOLO-annotated frame — with green bounding boxes, object labels, and a red crosshair showing where the tracker is aimed — rather than a raw camera frame. This grounds LLaVA's reasoning in what YOLO has already detected, reducing hallucination and improving command accuracy.
+When a command contains a visual attribute (colour, clothing, held object), LLaVA receives the YOLO-annotated frame and is asked exactly one focused question:
+"I am looking for a person with a red jacket.
+In which region of the frame is this person located?
+Reply with exactly one word: left, center, right, or notfound."
 
-The current YOLO scene state (target class, detection status, count, movement, position) is also included as text in every LLaVA prompt.
+LLaVA returns a single region. The detector node locks YOLO onto the largest matching bounding box in that region. From that point YOLO and optical flow track the target spatially — LLaVA is never called again for that target. The person can remove their jacket and the camera continues tracking them.
 
 ### Dynamic Target Switching
 
-The tracked object class can be changed at runtime by voice or typed command: <br>
-follow that bottle      → YOLO switches from 'person' to 'bottle' <br>
-track that chair        → YOLO switches to 'chair' <br>
-go back to people       → YOLO switches back to 'person' <br>
+The tracked object class can be changed at runtime:
+follow that bottle      → YOLO switches to 'bottle'
+track the chair         → YOLO switches to 'chair'
+go back to people       → YOLO switches to 'person'
 
-Any of the 80 COCO object classes that YOLOv8s was trained on can be used as a tracking target.
+Any of the 80 COCO object classes that YOLOv8s was trained on can be used.
+
+### Reselection Among Multiple Targets
+
+When multiple instances of the target are visible:
+focus on the person on the left
+→ switches to largest box left of current tracked box
+→ no LLaVA needed
+focus on the one in the blue shirt
+→ LLaVA identifies region containing blue shirt
+→ locks onto that box
 
 ---
 
@@ -178,12 +203,10 @@ Any of the 80 COCO object classes that YOLOv8s was trained on can be used as a t
 - Ubuntu 24.04
 - ROS2 Jazzy Jalisco (desktop)
 - Python 3.12
-- PyTorch with CUDA support (cu118)
+- PyTorch with CUDA 11.8
 - Ultralytics YOLOv8
 - OpenCV
 - Ollama with `llava:7b` model
-- faster-whisper
-- sounddevice, webrtcvad, portaudio
 
 **Raspberry Pi 4:**
 - Debian 12 Bookworm
@@ -192,7 +215,6 @@ Any of the 80 COCO object classes that YOLOv8s was trained on can be used as a t
 - RPi.GPIO
 
 ### Repository Structure
-```
 ros2_ws/src/
 ├── pantilt_interfaces/            # Custom message definitions
 │   ├── msg/
@@ -209,14 +231,15 @@ ros2_ws/src/
 │   ├── motor_driver_node.py
 │   ├── viz_node.py
 │   ├── llm_node.py
-│   ├── voice_input_node.py
-│   └── command_interface_node.py
+│   ├── intent_parser.py
+│   ├── command_interface_node.py
+│   └── voice_input_node.py    # Work in progress
 ├── resource/
 │   └── pantilt_tracker
 ├── package.xml
 ├── setup.cfg
 └── setup.py
-```
+
 ---
 
 ## Setup Guide
@@ -247,11 +270,6 @@ pip install torch torchvision torchaudio \
 
 # YOLO and vision
 pip install ultralytics opencv-python numpy \
-  --break-system-packages
-
-# Voice input
-sudo apt install portaudio19-dev libportaudio2 -y
-pip install faster-whisper sounddevice webrtcvad \
   --break-system-packages
 ```
 
@@ -286,7 +304,6 @@ wget https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8s.pt
 #### 6. Update the model path in detector_node.py
 
 ```python
-# In detector_node.py, update this line to match your username
 self.model = YOLO(
     '/home/YOUR_USERNAME/Projects/ros_project1/models/yolov8s.pt',
     task='detect')
@@ -376,7 +393,7 @@ ros2 run pantilt_tracker controller_node
 ros2 run pantilt_tracker viz_node
 ```
 
-### LLM voice interface (optional)
+### LLM command interface (optional)
 
 Ensure Ollama is running:
 ```bash
@@ -388,12 +405,8 @@ ollama serve
 ros2 run pantilt_tracker llm_node
 ```
 
-**Laptop — Terminal 5 — choose one:**
+**Laptop — Terminal 5:**
 ```bash
-# Voice input — speak commands naturally
-ros2 run pantilt_tracker voice_input_node
-
-# OR typed input
 ros2 run pantilt_tracker command_interface_node
 ```
 
@@ -413,59 +426,59 @@ ros2 topic echo /tracker/status           # TRACKING / SEARCHING / LOST
 
 ### PI Controller (`controller_node.py`)
 
-| Parameter | Default | Effect |
+| Parameter | Current value | Effect |
 |---|---|---|
-| `KP_PAN` | 0.12 | Pan proportional gain. Higher = faster response, too high = oscillation |
-| `KP_TILT` | 0.20 | Tilt proportional gain |
+| `KP_PAN` | 0.09 | Pan proportional gain. Higher = faster response, too high = oscillation |
+| `KP_TILT` | 0.10 | Tilt proportional gain. Keep lower than pan — tilt fights gravity |
 | `KI_PAN` | 0.005 | Pan integral gain. Eliminates steady-state offset |
-| `KI_TILT` | 0.002 | Tilt integral gain |
-| `DEADZONE_INNER` | 25 | Pixel radius where motors stop correcting |
+| `KI_TILT` | 0.0 | Tilt integral gain. Set to 0 to prevent integral windup oscillation |
+| `DEADZONE_INNER` | 30 | Pixel radius where motors stop correcting |
 | `DEADZONE_OUTER` | 50 | Pixel radius where full correction speed applies |
-| `LOST_TIMEOUT` | 2.0 | Seconds before entering search sweep after losing target |
-| `SEARCH_SPEED` | 12.0 | Pan speed during search sweep |
+| `INTEGRAL_CLAMP` | 15.0 | Maximum integral accumulation. Prevents windup during large errors |
+
+**Tilt oscillation guide:**
+If tilt oscillates on startup, reduce `KP_TILT` in steps of 0.02 until stable. Keep `KI_TILT` at 0.0 unless the camera consistently fails to centre vertically — only then add it back in steps of 0.001. Widening `DEADZONE_INNER` to 40 or 50 also reduces oscillation by preventing correction of small errors.
 
 ### LLM Command Speeds (`controller_node.py`)
 
-| Key | Default | Effect |
+| Key | Value | Effect |
 |---|---|---|
 | `slow` | 7.0 | Motor speed for "slowly", "gently" phrased commands |
 | `medium` | 13.0 | Default speed for directional commands |
 | `fast` | 25.0 | Motor speed for "fast", "quickly" phrased commands |
 
-### Voice Input (`voice_input_node.py`)
-
-| Parameter | Default | Effect |
-|---|---|---|
-| `WHISPER_MODEL` | `base` | `tiny` is faster, `small` is more accurate |
-| `VAD_AGGRESSIVENESS` | `2` | 0–3, higher = more aggressive background noise filtering |
-| `SILENCE_THRESHOLD` | `0.8` | Seconds of silence before clip is sent to Whisper |
-
 ### Detection (`detector_node.py`)
 
-| Parameter | Default | Effect |
+| Parameter | Value | Effect |
 |---|---|---|
-| `MIN_THRESH` | `0.45` | YOLO confidence threshold. Lower = more detections, more false positives |
-| `MOVEMENT_THRESHOLD` | `4.0` | Optical flow magnitude in pixels above which target is classified as moving |
+| `MIN_THRESH` | 0.45 | YOLO confidence threshold. Lower = more detections, more false positives |
+| `MOVEMENT_THRESHOLD` | 4.0 | Optical flow magnitude above which target is classified as moving |
 
 ---
 
 ## Known Limitations
 
-- DC geared motors have no encoders so pixel-perfect centering is not achievable. The camera settles within approximately 25-40px of centre.
-- End-to-end latency is approximately 80-120ms from WiFi and JPEG compression. Acceptable for person tracking, insufficient for fast-moving small objects.
-- LLaVA commands take 2-4 seconds to process. During this time the camera continues its last behaviour.
-- YOLOv8s covers 80 COCO object classes. Objects outside these classes cannot be tracked regardless of voice command.
+- DC geared motors have no encoders so pixel-perfect centring is not achievable. The camera settles within approximately 25-40px of centre.
+- End-to-end latency is approximately 80-120ms from WiFi and JPEG compression.
+- LLaVA visual grounding takes 2-4 seconds. During this time the camera continues its last behaviour.
+- LLaVA is only invoked for visual attribute queries. All direct movement and tracking commands are handled instantly by the intent parser.
+- YOLOv8s covers 80 COCO object classes. Objects outside these classes cannot be tracked.
 - The mechanical structure built from Lego and cardboard introduces physical play that affects precision.
+- Tilt integral gain is set to zero to prevent oscillation caused by the tilt motor fighting gravity without encoder feedback.
 
 ---
 
 ## Future Improvements
 
-- IMU (MPU6050) on the camera mount for precise angle-based movement ("turn exactly 90 degrees")
+- IMU (MPU6050) on the camera mount for precise angle-based movement commands ("turn exactly 90 degrees") — eliminates the need for timed panning
+- Encoder feedback on tilt motor to enable integral gain and eliminate gravity-induced drift
 - Wheel base for full mobile tracking
 - Wake word detection for hands-free activation
-- Person re-identification to track a specific individual across occlusions
-- Upgrade to YOLO11 for improved detection accuracy
+- Voice command input via faster-whisper (work in progress)
+- Fine-tuned CLIP model for faster and more reliable colour and attribute detection, replacing LLaVA for visual grounding
+- Person re-identification (OSNet or torchreid) to track a specific individual across occlusions
+- Gesture recognition via MediaPipe for non-verbal camera control
+- YOLO11 upgrade for improved detection accuracy
 
 ---
 
