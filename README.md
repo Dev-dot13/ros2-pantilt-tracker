@@ -63,8 +63,8 @@ The system has two layers of intelligence:
 │                      RASPBERRY PI 4 (Docker)                         │
 │                                                                      │
 │           camera_node                    motor_driver_node           │
-│                │                                │                   │
-│          USB camera                      GPIO + PWM                   │
+│                │                                │                    │
+│          USB camera                      GPIO + PWM                  │
 │       compressed JPEG                    DRV8833 driver              │
 │          streaming                       Pan + Tilt motors           │
 └──────────────────────────────────────────────────────────────────────┘
