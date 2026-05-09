@@ -53,18 +53,18 @@ The system has two layers of intelligence:
 │  inference │             LLaVA command layer                         │
 │  + optical │                                                         │
 │    flow    ▼                                                         │
-│     /camera/image/annotated ──► llm_node (LLaVA visual context)     │
+│     /camera/image/annotated ──► llm_node (LLaVA visual context)      │
 │     /tracker/scene_info     ──► controller_node                      │
 │                                                                      │
 │                           viz_node                                   │
-└──────────────┬────────────────────┬─────────────────────────────────┘
+└──────────────┬────────────────────┬──────────────────────────────────┘
 │ WiFi (DDS)         │ WiFi (DDS)
-┌──────────────▼────────────────────▼─────────────────────────────────┐
-│                      RASPBERRY PI 4 (Docker)                        │
+┌──────────────▼────────────────────▼──────────────────────────────────┐
+│                      RASPBERRY PI 4 (Docker)                         │
 │                                                                      │
 │           camera_node                    motor_driver_node           │
 │                │                                │                   │
-│          USB camera                      GPIO + PWM                  │
+│          USB camera                      GPIO + PWM                   │
 │       compressed JPEG                    DRV8833 driver              │
 │          streaming                       Pan + Tilt motors           │
 └──────────────────────────────────────────────────────────────────────┘
@@ -215,6 +215,7 @@ focus on the one in the blue shirt
 - RPi.GPIO
 
 ### Repository Structure
+```
 ros2_ws/src/
 ├── pantilt_interfaces/            # Custom message definitions
 │   ├── msg/
@@ -239,7 +240,7 @@ ros2_ws/src/
 ├── package.xml
 ├── setup.cfg
 └── setup.py
-
+```
 ---
 
 ## Setup Guide
