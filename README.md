@@ -8,7 +8,9 @@ A distributed ROS2 implementation of a real-time object-tracking pan-tilt camera
 
 ## Demo
 
-> Photos and working videos coming soon.
+https://github.com/user-attachments/assets/8bcb4f2a-7976-4a79-9b14-780bf0d8ec72
+
+> More photos and working videos coming soon.
 
 ---
 
